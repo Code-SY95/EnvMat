@@ -1,0 +1,166 @@
+model:
+  base_learning_rate: 1.0e-06
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: packed # Sy: VAE stage. 'packed' means that 4 PBR maps(diffuse, normal, roughness, specular) are packed into single tensor by concatination along the channel dim.
+    cond_stage_key: # Sy: ddpm.get_input()의 batch dict의 keys. condition tensor 처리 부분
+      # - render
+      - packed # Sy:
+      - image_embed # Sy: It's render images
+      # - sketch # Sy:
+      # - palette
+      # - text
+    image_size: 32
+    channels: 12
+    cond_stage_trainable: true
+    conditioning_key: hybrid
+    monitor: val/loss_simple_ema
+
+    ucg_training: 
+      # render:
+      #   p: 0.5
+      #   val: 0.0
+      image_embed:
+        p: 0.5
+        val: 0.0
+      # palette:
+      #   p: 0.5
+      #   val: 0.0
+      # sketch:
+      #   p: 0.5s
+      #   val: 0.0
+      text:
+        p: 0.5
+        val: ""
+      all:
+        keep: 0.1
+        drop: 0.1
+
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32
+        # in_channels: 20
+        in_channels: 12 # Sy:
+        out_channels: 12
+        model_channels: 256
+        attention_resolutions:
+        #note: this isn\t actually the resolution but
+        # the downsampling factor, i.e. this corresnponds to
+        # attention on spatial resolution 8,16,32, as the
+        # spatial reolution of the latents is 32 for f8
+        - 4
+        - 2
+        - 1
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 4
+        num_head_channels: 32
+        use_spatial_transformer: true
+        transformer_depth: 1
+        context_dim: 512
+        use_checkpoint: true
+        legacy: false
+
+
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelMulti
+      params:
+        embed_dim: 3
+        n_embed: 4096
+        # ckpt_path: weights/vqgan/vq-gan-f8-mix-840.pt
+        ckpt_path: /mnt/1TB/MatGen/src/log/autoencoder/pbr_vae/last.ckpt-v4_ep9_valloss1.23.ckpt # Sy: 
+        ddconfig:
+          double_z: false
+          z_channels: 256
+          resolution: 256
+          in_channels: 3
+          out_ch: 12
+          ch: 128
+          ch_mult:
+          - 1
+          - 1
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions:
+          - 
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.multicondition.MultiConditionEncoder
+      params:
+        image_embed_config:
+          target: ldm.modules.encoders.modules.FrozenCLIPImageEmbedder
+          params:
+            model: ViT-B/16
+        text_embed_config:
+          target: ldm.modules.encoders.modules.FrozenCLIPSentenceEmbedder
+          params:
+            version: sentence-transformers/clip-ViT-B-16
+        binary_encoder_config:
+          target: ldm.modules.encoders.modules.SimpleEncoder
+          params:
+            in_channels: 1
+            out_channels: 4
+        palette_proj_config:
+          target: ldm.modules.encoders.multicondition.PaletteEncoder
+          params:
+            in_ch: 3
+            hid_ch: 64
+            out_ch: 512
+        
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 32
+    num_workers: 0 # Sy:
+    wrap: false
+    train:
+      target: data.matfuse.MatFuseDataset
+      params:
+        data_root: sample
+        # data_root: data/maps
+        size: 256
+        output_names: # Sy: Change diffuse/specular -> basecolor/metallic
+          - basecolor
+          - normal
+          - roughness
+          - metallic
+        # render : /*/renders
+    validation:
+      target: data.matfuse.MatFuseDataset
+      params:
+        data_root: sample
+        # data_root: data/test
+        size: 256
+        output_names:
+          - basecolor
+          - normal
+          - roughness
+          - metallic
+        # render : /*/renders
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 6
+        max_images: 4
+        increase_log_steps: False
+        log_images_kwargs: 
+          ddim_steps: 50
+  # Sy: 
+  trainer:
+    max_epochs: 400
