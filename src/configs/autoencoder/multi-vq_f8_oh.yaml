@@ -34,13 +34,13 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 4 # Sy
-    num_workers: 8 # Sy
+    batch_size: 2 # Sy
+    num_workers: 4 # Sy
     wrap: false
     train:
       target: ldm.data.matfuse.MatFuseDataset
       params:
-        data_root: data/maps # Sy
+        data_root: data/train # Sy
         size: 256
         output_names:
           - basecolor
@@ -50,7 +50,7 @@ data:
     validation:
       target: ldm.data.matfuse.MatFuseDataset
       params:
-        data_root: data/test # Sy
+        data_root: data/validation # Sy
         size: 256
         output_names:
           - basecolor
@@ -72,5 +72,4 @@ lightning:
   trainer:
     benchmark: True
     accumulate_grad_batches: 2
-    max_epochs: 12 # Sy: Suggested by vq-gan paper
-    gpus: 2,3
+    max_epochs: 73 # Sy: Suggested by vq-gan paper

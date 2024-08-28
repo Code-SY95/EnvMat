@@ -462,7 +462,7 @@ class VQModelMulti(VQModel):
         if return_pred_indices: # Sy: training_step에서 return_pred_indices=True
             return dec, diff, ind
         return dec, diff
-    """" 
+    """ 
     # Sy: VQModel 클래스의 log_images 함수가 호출되면서 x.shape[1] = 12 (4개의 map이 packed 된 input) 인 채로 if x.shape[1] > 3: 조건문이 실행.
           이 조건은 x에 masking이 되어 채널수가 4 이상이 될때 돌아가야 하는 코드(by ChatGPT)인데, 이 조건문이 masking이 없는 상황에서 작동되어 AssertionError가 발생.
           그래서 새로 log_images 함수를 정의하고 log에 각 map 별 값들도 기록하도록 수정.

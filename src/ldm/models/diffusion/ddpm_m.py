@@ -20,6 +20,7 @@ from pytorch_lightning.utilities.distributed import rank_zero_only
 from torch.optim.lr_scheduler import LambdaLR
 from torchvision.utils import make_grid
 from tqdm import tqdm
+import gc
 
 # import wandb
 from ldm.models.autoencoder import AutoencoderKL, IdentityFirstStage, VQModelInterface
@@ -46,6 +47,9 @@ from ldm.util import (
     visualize_palette,
 )
 
+from ldm.modules.losses.mitsuba_rendering import RaytracingOperator # Sy:
+from ldm.modules.losses.rendering import GGXRenderer # Sy:
+
 __conditioning_keys__ = {"concat": "c_concat", "crossattn": "c_crossattn", "adm": "y"}
 
 
@@ -64,8 +68,6 @@ class DDPM(pl.LightningModule):
     def __init__(
         self,
         unet_config,
-        # env_unet_config, # Sy: Env ldm
-        # render_loss, # Sy: Latent level rendering loss 
         timesteps=1000,
         beta_schedule="linear",
         loss_type="l2",
@@ -114,9 +116,7 @@ class DDPM(pl.LightningModule):
         self.use_positional_encodings = use_positional_encodings
 
         self.model = DiffusionWrapper(unet_config, conditioning_key)
-        # Sy: I have two models (PBR LDM & Env LDM). 
-        # self.model_env = DiffusionWrapper(unet_config, conditioning_key) # Sy: PBR LDM
-        # self.model_pbr = DiffusionWrapper(env_unet_config, conditioning_key) # Sy: Env LDM
+        
         count_params(self.model, verbose=True)
         self.use_ema = use_ema
         if self.use_ema:
@@ -148,8 +148,7 @@ class DDPM(pl.LightningModule):
             cosine_s=cosine_s,
         )
 
-        self.loss_type = loss_type
-        # self.render_loss = render_loss # Sy: I add latent level rendering loss
+        self.loss_type = loss_type # Sy: l2
 
         self.learn_logvar = learn_logvar
         self.logvar = torch.full(
@@ -166,8 +165,6 @@ class DDPM(pl.LightningModule):
             self.p_drop = ucg_all["drop"]
             self.p_keep = ucg_all["keep"]
             self.p_mixed = 1 - self.p_drop - self.p_keep
-        
-        # wandb.init(project="matGen", entity="sogang_swatchon") # Sy:
 
     def register_schedule(
         self,
@@ -190,7 +187,7 @@ class DDPM(pl.LightningModule):
             )
         alphas = 1.0 - betas
         alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
+        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1]) # Sy: Add 1.0 to the first term in alphas_cuprod and remove the last term.
 
         (timesteps,) = betas.shape
         self.num_timesteps = int(timesteps)
@@ -224,7 +221,7 @@ class DDPM(pl.LightningModule):
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = (1 - self.v_posterior) * betas * (
             1.0 - alphas_cumprod_prev
-        ) / (1.0 - alphas_cumprod) + self.v_posterior * betas
+            ) / (1.0 - alphas_cumprod) + self.v_posterior * betas
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
         self.register_buffer("posterior_variance", to_torch(posterior_variance))
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
@@ -258,7 +255,7 @@ class DDPM(pl.LightningModule):
             )
         else:
             raise NotImplementedError("mu not supported")
-        lvlb_weights[0] = lvlb_weights[1]
+        lvlb_weights[0] = lvlb_weights[1] # Sy: lvlb_weights[0] = inf
         self.register_buffer("lvlb_weights", lvlb_weights, persistent=False)
         assert not torch.isnan(self.lvlb_weights).all()
 
@@ -442,10 +439,10 @@ class DDPM(pl.LightningModule):
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         return (
-            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start # Sy: sqrt(alpha_cumprod_t) * z0
+            + extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) # Sy: sqrt(1- alpha_cumprod_t) * epsilon
             * noise
-        )
+        ) # Sy: return z_t.
 
     def get_loss(self, pred, target, mean=True):
         if self.loss_type == "l1":
@@ -481,13 +478,13 @@ class DDPM(pl.LightningModule):
 
         log_prefix = "train" if self.training else "val"
 
-        loss_dict.update({f"{log_prefix}/loss_simple": loss.mean()})
-        loss_simple = loss.mean() * self.l_simple_weight
+        loss_dict.update({f"{log_prefix}/recon_loss_simple": loss.mean()})
+        recon_loss_simple = loss.mean() * self.l_simple_weight
 
         loss_vlb = (self.lvlb_weights[t] * loss).mean()
         loss_dict.update({f"{log_prefix}/loss_vlb": loss_vlb})
 
-        loss = loss_simple + self.original_elbo_weight * loss_vlb
+        loss = recon_loss_simple + self.original_elbo_weight * loss_vlb
 
         loss_dict.update({f"{log_prefix}/loss": loss})
 
@@ -660,7 +657,9 @@ class LatentDiffusion(DDPM):
 
     def __init__(
         self,
-        first_stage_config,
+        # first_stage_config,
+        first_stage_config_pbr, # Sy:
+        first_stage_config_env, # Sy:
         cond_stage_config,
         num_timesteps_cond=None,
         cond_stage_key="image",
@@ -687,17 +686,21 @@ class LatentDiffusion(DDPM):
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
-        self.cond_stage_key = cond_stage_key # Sy: cond_stage_key
+        self.cond_stage_key = cond_stage_key # Sy: ['packed', 'image_embed']
 
         try:
-            self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
+            # self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
+            self.num_downs = len(first_stage_config_pbr.params.ddconfig.ch_mult) - 1 # Sy:
+            self.num_downs = len(first_stage_config_env.params.ddconfig.ch_mult) - 1
         except:
             self.num_downs = 0
         if not scale_by_std:
             self.scale_factor = scale_factor
         else:
             self.register_buffer("scale_factor", torch.tensor(scale_factor))
-        self.instantiate_first_stage(first_stage_config)
+        # self.instantiate_first_stage(first_stage_config)
+        self.instantiate_first_stage_pbr(first_stage_config_pbr) # Sy:
+        self.instantiate_first_stage_env(first_stage_config_env)
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
@@ -766,19 +769,26 @@ class LatentDiffusion(DDPM):
         self.shorten_cond_schedule = self.num_timesteps_cond > 1
         if self.shorten_cond_schedule:
             self.make_cond_schedule()
-
-    def instantiate_first_stage(self, config):
+    ### Sy: Modify to receive input from two VAEs.
+    def instantiate_first_stage_pbr(self, config):
         model = instantiate_from_config(config)
-        self.first_stage_model = model.eval()
-        self.first_stage_model.train = disabled_train
-        for param in self.first_stage_model.parameters():
+        self.first_stage_model_pbr = model.eval()
+        self.first_stage_model_pbr.train = disabled_train
+        for param in self.first_stage_model_pbr.parameters():
+            param.requires_grad = False
+            
+    def instantiate_first_stage_env(self, config):
+        model = instantiate_from_config(config)
+        self.first_stage_model_env = model.eval()
+        self.first_stage_model_env.train = disabled_train
+        for param in self.first_stage_model_env.parameters():
             param.requires_grad = False
 
     def instantiate_cond_stage(self, config):
         if not self.cond_stage_trainable:
             if config == "__is_first_stage__":
                 print("Using first stage also as cond stage.")
-                self.cond_stage_model = self.first_stage_model
+                self.cond_stage_model = self.first_stage_model_env # Sy:
             elif config == "__is_unconditional__":
                 print(f"Training {self.__class__.__name__} as an unconditional model.")
                 self.cond_stage_model = None
@@ -832,7 +842,7 @@ class LatentDiffusion(DDPM):
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
-                c = self.cond_stage_model(c) # Sy: self.cond_stage_model is MultiConditionEncoder.forward() -> {'c_crossattn': [b, 2, 512]}
+                c = self.cond_stage_model(c) # Sy: self.cond_stage_model is MultiConditionEncoder.forward() -> {'c_crossattn': [b, 2, 512]}. torch.Size가 쭈루룩 뜨는곳
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
@@ -981,8 +991,16 @@ class LatentDiffusion(DDPM):
         if bs is not None:
             x = x[:bs] # Sy: bs = batch size
         x = x.to(self.device)
-        encoder_posterior = self.encode_first_stage(x) # Sy: It return the z_0. [b, 12, 32, 32]
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
+        
+        ##### Sy: Modify to receive input from two VAEs. #####
+        x_pbr = x[:, :12, :, :]
+        x_env = x[:, 12:, :, :]
+        
+        encoder_posterior_pbr = self.encode_first_stage(x_pbr) # Sy: It return the z_0. [b, 12, 32, 32]
+        encoder_posterior_env = self.encode_first_stage(x_env)
+        
+        z_pbr = self.get_first_stage_encoding(encoder_posterior_pbr).detach()
+        z_env = self.get_first_stage_encoding(encoder_posterior_env).detach()
 
         if self.model.conditioning_key is not None: # Sy: self.model.conditioning_key is 'hybrid'
             if cond_key is None: 
@@ -1030,10 +1048,12 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {"pos_x": pos_x, "pos_y": pos_y}
-        out = [z, c] # Sy: z = [b, 12, 32, 32], c = {'packed': [b, 12, 256, 256], 'image_embed': [b, 3, 256, 256]}
+                
+        out = [z_pbr, z_env, c] # Sy: z = [b, 12, 32, 32], c = {'packed': [b, 12, 256, 256], 'image_embed': [b, 3, 256, 256]}
         if return_first_stage_outputs:
-            xrec = self.decode_first_stage(z) # Sy: z is noise or latent input.
-            out.extend([x, xrec]) # Sy: xrec is reconstruction image from decoder(z)
+            xrec_pbr = self.decode_first_stage(z_pbr) # Sy: z is noise or latent input.
+            xrec_env = self.decode_first_stage(z_env)
+            out.extend([x, xrec_pbr, xrec_env]) # Sy: xrec is reconstruction image from decoder(z)
         if return_x:
             out.extend([x])
         if return_original_cond:
@@ -1045,7 +1065,7 @@ class LatentDiffusion(DDPM):
         if predict_cids:
             if z.dim() == 4:
                 z = torch.argmax(z.exp(), dim=1).long()
-            z = self.first_stage_model.quantize.get_codebook_entry(z, shape=None)
+            z = self.first_stage_model_pbr.quantize.get_codebook_entry(z, shape=None)
             z = rearrange(z, "b h w c -> b c h w").contiguous()
 
         z = 1.0 / self.scale_factor * z
@@ -1074,9 +1094,10 @@ class LatentDiffusion(DDPM):
                 z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))
 
                 # 2. apply model loop over last dim
-                if isinstance(self.first_stage_model, VQModelInterface):
+                # if isinstance(self.first_stage_model, VQModelInterface):
+                if isinstance(self.first_stage_model_env, VQModelInterface): # Sy:
                     output_list = [
-                        self.first_stage_model.decode(
+                        self.first_stage_model_env.decode( # Sy:
                             z[:, :, :, :, i],
                             force_not_quantize=predict_cids or force_not_quantize,
                         )
@@ -1085,7 +1106,7 @@ class LatentDiffusion(DDPM):
                 else:
 
                     output_list = [
-                        self.first_stage_model.decode(z[:, :, :, :, i])
+                        self.first_stage_model_pbr.decode(z[:, :, :, :, i]) # Sy:
                         for i in range(z.shape[-1])
                     ]
 
@@ -1100,20 +1121,22 @@ class LatentDiffusion(DDPM):
                 decoded = decoded / normalization  # norm is shape (1, 1, h, w)
                 return decoded
             else:
-                if isinstance(self.first_stage_model, VQModelInterface):
-                    return self.first_stage_model.decode(
+                if isinstance(self.first_stage_model_env, VQModelInterface): # Sy:
+                    return self.first_stage_model_env.decode(
                         z, force_not_quantize=predict_cids or force_not_quantize
                     )
                 else:
-                    return self.first_stage_model.decode(z)
+                    return self.first_stage_model_pbr.decode(z) # Sy:
 
         else:
-            if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(
-                    z, force_not_quantize=predict_cids or force_not_quantize
-                )
-            else:
-                return self.first_stage_model.decode(z)
+            ### Sy: z_env decoding.
+            if z.shape[1] == 3:
+                if isinstance(self.first_stage_model_env, VQModelInterface): # Sy:
+                    return self.first_stage_model_env.decode(
+                        z, force_not_quantize=predict_cids or force_not_quantize
+                    )
+            else: # Sy: z_pbr Decoding.
+                return self.first_stage_model_pbr.decode(z) # Sy:
 
     @torch.no_grad()
     def encode_first_stage(self, x):
@@ -1157,28 +1180,117 @@ class LatentDiffusion(DDPM):
                 return decoded
 
             else:
-                return self.first_stage_model.encode(x)
+                ### Sy:
+                if x.shape[1] == 12:
+                    return self.first_stage_model_pbr.encode(x) # Sy: [b, 12, 32, 32]
+                else:
+                    return self.first_stage_model_env.encode(x)
         else:
-            return self.first_stage_model.encode(x) # Sy: [b, 12, 32, 32]
+            ### Sy:
+            if x.shape[1] == 12:
+                return self.first_stage_model_pbr.encode(x) # Sy: [b, 12, 32, 32]
+            else:
+                return self.first_stage_model_env.encode(x)
 
     def shared_step(self, batch, **kwargs): # Sy: Initialy called the validation_step
-        x, c = self.get_input(batch, self.first_stage_key) # Sy: self.first_stage_key is 'Packed' -> It should be change to 'packed'
-        loss = self(x, c) # Sy: Call forward. x = [b, 12, 32, 32], c = {'packed': [b, 12, 256, 256], 'image_embed': [b, 3, 256, 256]}
+        # x, c = self.get_input(batch, self.first_stage_key) # Sy: self.first_stage_key is 'Packed' -> It should be change to 'packed'
+        # loss = self(x, c) # Sy: Call forward. x = [b, 12, 32, 32], c = {'packed': [b, 12, 256, 256], 'image_embed': [b, 3, 256, 256]}
+        # Sy: 
+        # z_pbr, z_env, x, xrec, c = self.get_input(batch, self.first_stage_key)
+        # loss = self(z_pbr, z_env, x, c)
+        z_pbr, z_env, c = self.get_input(batch, self.first_stage_key)
+        loss = self(z_pbr, z_env, c)
         return loss
+    
+# z, c, x, xrec, xc = self.get_input(
+#             batch,
+#             self.first_stage_key,
+#             return_first_stage_outputs=True,
+#             force_c_encode=True,
+#             return_original_cond=True,
+#             bs=N,
+#         )
 
-    def forward(self, x, c, *args, **kwargs):
-        t = torch.randint(
-            0, self.num_timesteps, (x.shape[0],), device=self.device
+    def forward(self, z_pbr, z_env, c, *args, **kwargs): # Sy: forward for diffusion UNet model. c is the dict of tensor refers to embeded render image & text prompt(='')
+        
+        t = torch.randint( # Sy: t is a random int(0~1000) equal to the number of batches(=z_pbr.shape[0]).
+            0, self.num_timesteps, (z_pbr.shape[0],), device=self.device
         ).long()
-        if self.model.conditioning_key is not None:
-            assert c is not None
+        
+        ### Sy: input_pbr, input_env is the G.T input maps. It will be used for compute renderig loss.
+        input_pbr = c["packed"][:, :12, :, :]
+        input_env = c["packed"][:, 12:, :, :]
+        z = torch.cat([z_pbr, z_env], dim=1)
+        
+        if self.model.conditioning_key is not None: # Sy: self.model.conditioning_key = 'hybrid'
+            assert c is not None # Sy: c = {"packed": concat(input pbr map and env map) [b, h, w, c], "image_embed": , "envs": , "text": }
             if self.cond_stage_trainable:
-                c = self.get_learned_conditioning(c)
+                c = self.get_learned_conditioning(c) # Sy: 여기서 torch.Size~~~ 가 쭈루룩 print. self.get_learned_conditioning(c) = {"c_crossattn": [b, 2, 512]}. Embed the condition.
                 # conditions = c.pop("conditions")
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-        return self.p_losses(x, c, t, *args, **kwargs) # Sy: x = [b, 12, 32, 32], c = {'c_crossattn': [b, 2, 512]},  return loss, loss_dict
+        return self.p_losses(z, input_pbr, input_env, c, t, *args, **kwargs) # Sy: x = [b, 12, 32, 32], c = {'c_crossattn': [b, 2, 512]},  return total_loss(= recon_loss + render_loss), loss_dict
+        
+        # ###### Sy: Define a new Loss Function. ######
+        # z = torch.cat([z_pbr, z_env], dim=1)
+        # recon_loss, recon_loss_dict, z_t, epsilon_theta_t = self.p_losses(z, input_pbr, input_env, c, t, *args, **kwargs)
+
+        # render_fn = RaytracingOperator(scene_name="plane",
+        #                                ldr=True,
+        #                                scene_path="/home/sogang/mnt/db_2/oh/MatGen/src/plane_scene.xml",
+        #                                illumi_gamma=2.4,
+        #                                illumi_scale=1,
+        #                                illumi_normalize=0.5,
+        #                                texture_res=256,
+        #                                device=self.device)
+        
+        # zt_pbr = z_t[:, :12, :, :]
+        # zt_env = z_t[:, 12:, :, :]
+        
+        # ### Sy: Predict z0 from z_t with an expression( z0 = (z_t - sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t / sqrt(alpha_cumprod_t)  Reference: https://arxiv.org/pdf/2208.11970 -> formular (115)) and render with the predicted x0.
+        # ###     Render input as well and find the difference between the two to use as Render Loss.
+        # sqrt_alphas_cumprod = extract_into_tensor(self.sqrt_alphas_cumprod, t, z.shape)
+        # sqrt_one_minus_alphas_cumprod = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, z.shape)
+        # pbr_epsilon_theta_t = epsilon_theta_t[:, :12, :, :]
+        # env_epsilon_theta_t = epsilon_theta_t[:, 12:, :, :]
+        
+        # z0_pbr = (zt_pbr - sqrt_one_minus_alphas_cumprod) * pbr_epsilon_theta_t / sqrt_alphas_cumprod 
+        # z0_env = (zt_env - sqrt_one_minus_alphas_cumprod) * env_epsilon_theta_t / sqrt_alphas_cumprod
+        # # Sy: z0 = (z_t - sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t / sqrt(alpha_cumprod_t)
+        
+            
+        # ### Sy: Predict z0 by using Tweedie’s Formula. Reference: https://arxiv.org/pdf/2208.11970 -> formular (133)
+        # ###     z0 = (z_t + (1 - alpha_cumprod_t) ∇log p(z_t) ) / sqrt(alpha_cumprod_t)
+        # ###     score function ∇ log p(z_t) = - ( 1 / sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t -> formular (151)
+        # # score_function = - epsilon_theta_t / sqrt_one_minus_alphas_cumprod
+        # # pbr_score_function = score_function[:, :12, :, :]
+        # # env_score_function = score_function[:, 12:, :, :]
+        # # one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod**2
+        
+        # # z0_pbr = (zt_pbr + one_minus_alphas_cumprod ) * score_function / sqrt_alphas_cumprod 
+        # # z0_env = (zt_env + one_minus_alphas_cumprod ) * score_function / sqrt_alphas_cumprod
+        
+        
+        # x0_pbr_pred = self.decode_first_stage(z0_pbr)
+        # x0_env_pred = self.decode_first_stage(z0_env)
+        
+        # render_gt = []
+        # render_recon = []
+        
+        # for b in range(z.shape[0]):
+        #     # render_gt.append(render_fn.forward_multiview(envmap=input_env[b], basecolor=input_pbr[b][:3, :, :], normal=input_pbr[b][3:6, :, :], metallic=input_pbr[b][6:9, :, :], roughness=input_pbr[b][9:, :, :]))
+        #     # render_recon.append(render_fn.forward_multiview(envmap=x0_env_pred[b], basecolor=x0_pbr_pred[b][:3, :, :], normal=x0_pbr_pred[b][3:6, :, :], metallic=x0_pbr_pred[b][6:9, :, :], roughness=x0_pbr_pred[b][9:, :, :]))
+        #     render_gt.append(render_fn.forward_multiview(input_env[b], input_pbr[b]))
+        #     render_recon.append(render_fn.forward_multiview(x0_env_pred[b], x0_pbr_pred[b]))
+            
+        # render_gt = torch.stack(render_gt, dim=0).to(self.device)
+        # render_recon = torch.stack(render_recon, dim=0).to(self.device)
+        
+        # render_loss = self.get_loss(render_gt, render_recon)
+        
+        # total_loss = recon_loss + render_loss
+        # return total_loss, recon_loss_dict
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -1327,12 +1439,12 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond) # Sy: It calls DiffusionWrapper.forward. **cond is {'c_crossattn': [b, 2, 512]}
+            x_recon = self.model(x_noisy, t, **cond) # Sy: It calls DiffusionWrapper.UNetModel's forward. **cond is {'c_crossattn': [b, 2, 512]}
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
-            return x_recon
+            return x_recon # Sy: It is the UNet's output.
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
         return (
@@ -1356,40 +1468,111 @@ class LatentDiffusion(DDPM):
         )
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
-        noise = default(noise, lambda: torch.randn_like(x_start)) # Sy: [b, 12, 32, 32]
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise) # Sy: [b, 12, 32, 32]
-        model_output = self.apply_model(x_noisy, t, cond)
+    def p_losses(self, x_start, gt_pbr, gt_env, cond, t, noise=None, render_loss_weight=20): # Sy: Calculate the loss that minimizes the difference between the predicted_noise and G.T noise. This allows the DDPM model to learn how to restore the original image from the noisy image.
+        noise = default(noise, lambda: torch.randn_like(x_start)) # Sy: It means epsilon. [b, 12, 32, 32]
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise) # Sy: sampling z_t. [b, 12, 32, 32]
+        model_output = self.apply_model(x_noisy, t, cond) # Sy: Take the conditional information(cond) as input and predict the original image x_start(z0_pred). model output = epsilon_theta(z_t, t, y). self.apply_model is UNet.
 
         loss_dict = {}
         prefix = "train" if self.training else "val"
 
         if self.parameterization == "x0":
             target = x_start
-        elif self.parameterization == "eps":
+        elif self.parameterization == "eps": # Sy: noise becomes target.
             target = noise
         else:
             raise NotImplementedError()
 
-        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) # Sy: loss mean
-        loss_dict.update({f"{prefix}/loss_simple": loss_simple.mean()})
+        recon_loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3]) # Sy: mean values of l1 or l2 loss. Expressed as a formula : ||epsilon - epsilon(z_t, t, y)||_l2
+        loss_dict.update({f"{prefix}/recon_loss_simple": recon_loss_simple.mean()})
 
         logvar_t = self.logvar[t.cpu()].to(self.device)
-        loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        recon_loss = recon_loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = recon_loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
-            loss_dict.update({f"{prefix}/loss_gamma": loss.mean()})
+            loss_dict.update({f"{prefix}/loss_gamma": recon_loss.mean()})
             loss_dict.update({"logvar": self.logvar.data.mean()})
 
-        loss = self.l_simple_weight * loss.mean()
+        recon_loss = self.l_simple_weight * recon_loss.mean()
 
         loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f"{prefix}/loss_vlb": loss_vlb})
-        loss += self.original_elbo_weight * loss_vlb
-        loss_dict.update({f"{prefix}/loss": loss})
-
-        return loss, loss_dict
+        recon_loss += self.original_elbo_weight * loss_vlb
+        loss_dict.update({f"{prefix}/recon_loss": recon_loss})
+        
+        ###### Sy: Define a new Loss Function. ######
+        render_fn = RaytracingOperator(scene_name="plane",
+                                    ldr=True,
+                                    scene_path="/mnt/1TB/MatGen/pbrmap/plane_scene.xml",
+                                    illumi_gamma=2.4,
+                                    illumi_scale=1,
+                                    illumi_normalize=0.5,
+                                    texture_res=256,
+                                    device=self.device)
+        
+        # zt_pbr = x_noisy[:, :12, :, :]
+        # zt_env = x_noisy[:, 12:, :, :]
+        z_t = x_noisy 
+        
+        # ### Sy: Predict z0 from z_t with an expression( z0 = (z_t - sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t / sqrt(alpha_cumprod_t)  Reference: https://arxiv.org/pdf/2208.11970 -> formular (115)) and render with the predicted x0.
+        # ###     Render input as well and find the difference between the two to use as Render Loss.
+        sqrt_alphas_cumprod = extract_into_tensor(self.sqrt_alphas_cumprod, t, x_noisy.shape) # Sy: x_noisy.shape을 pbr이랑 env 각각 다르게 해야 하는가? No. 어차피 나오는 값은 동일.
+        sqrt_one_minus_alphas_cumprod = extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_noisy.shape)
+        # pbr_epsilon_theta_t = model_output[:, :12, :, :]
+        # env_epsilon_theta_t = model_output[:, 12:, :, :]
+        
+        
+        # z0_pbr = (zt_pbr - sqrt_one_minus_alphas_cumprod) * pbr_epsilon_theta_t / sqrt_alphas_cumprod 
+        # z0_env = (zt_env - sqrt_one_minus_alphas_cumprod) * env_epsilon_theta_t / sqrt_alphas_cumprod
+        
+        ## Sy: z0 = (z_t - sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t / sqrt(alpha_cumprod_t)
+        ## Sy: We estimate the original z0 using the noisy latent zt. When t is large the predicition is inacurate. When t is small the predicition is inacurate.
+        z0_pred = (z_t - sqrt_one_minus_alphas_cumprod) * model_output / sqrt_alphas_cumprod # Sy: model_output is epsilon_theta.
+        
+        
+        z0_pbr = z0_pred[:, :12, :, :]
+        z0_env = z0_pred[:, 12:, :, :]
+        
+            
+        # ### Sy: Predict z0 by using Tweedie’s Formula. Reference: https://arxiv.org/pdf/2208.11970 -> formular (133)
+        # ###     z0 = (z_t + (1 - alpha_cumprod_t) ∇log p(z_t) ) / sqrt(alpha_cumprod_t)
+        # ###     score function : ∇ log p(z_t) = - ( 1 / sqrt(1 - alpha_cumprod_t) ) * epsilon_theta_t -> formular (151)
+        # # pbr_score_function = - pbr_epsilon_theta_t / sqrt_one_minus_alphas_cumprod
+        # # env_score_function = - env_epsilon_theta_t / sqrt_one_minus_alphas_cumprod
+        # # one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod**2
+        
+        # # z0_pbr = (zt_pbr + one_minus_alphas_cumprod ) * pbr_score_function / sqrt_alphas_cumprod 
+        # # z0_env = (zt_env + one_minus_alphas_cumprod ) * env_score_function / sqrt_alphas_cumprod
+        
+        
+        x0_pbr_pred = self.decode_first_stage(z0_pbr)
+        x0_env_pred = self.decode_first_stage(z0_env)
+        
+        render_gt_list = []
+        render_recon_list = []
+        
+        for b in range(x_noisy.shape[0]): # Sy: x_noisy.shape = [b, 15, 32, 32]
+            # render_gt.append(render_fn.forward_multiview(envmap=input_env[b], basecolor=input_pbr[b][:3, :, :], normal=input_pbr[b][3:6, :, :], metallic=input_pbr[b][6:9, :, :], roughness=input_pbr[b][9:, :, :]))
+            # render_recon.append(render_fn.forward_multiview(envmap=x0_env_pred[b], basecolor=x0_pbr_pred[b][:3, :, :], normal=x0_pbr_pred[b][3:6, :, :], metallic=x0_pbr_pred[b][6:9, :, :], roughness=x0_pbr_pred[b][9:, :, :]))
+            render_gt_list.append(render_fn.forward_multiview(gt_env[b], gt_pbr[b])) # Sy: gt_env.shape = [B, C, H, W] = [32, 3, 256, 256], for example.
+            render_recon_list.append(render_fn.forward_multiview(x0_env_pred[b], x0_pbr_pred[b]))
+            # Sy: forward_multiview call render_multiview(self, envmap, basecolor, normal, metallic, roughness, r=1.5, theta=0, phi=0, spp=256) function. spp=256 means single pixel color rendered by casting 256 rays through that pixel.
+            
+        render_gt = torch.stack(render_gt_list, dim=0).to(self.device) # Sy: Make batch stack.
+        render_recon = torch.stack(render_recon_list, dim=0).to(self.device)
+        
+        render_loss = self.get_loss(render_gt, render_recon) # Sy: Get L2 loss.
+        loss_dict.update({f"{prefix}/render_loss": render_loss})
+        
+        total_loss = recon_loss + render_loss_weight * render_loss
+        loss_dict.update({f"{prefix}/total_loss": total_loss})
+        
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        return total_loss, loss_dict
+        # return recon_loss, loss_dict # Sy: x_noisy = z_t, model_output = epsilon_theta(z_t, t, y)
 
     def p_mean_variance(
         self,
@@ -1425,7 +1608,12 @@ class LatentDiffusion(DDPM):
         if clip_denoised:
             x_recon.clamp_(-1.0, 1.0)
         if quantize_denoised:
-            x_recon, _, [_, _, indices] = self.first_stage_model.quantize(x_recon)
+            ### Sy:
+            if x.shape[1] == 12:
+                x_recon, _, [_, _, indices] = self.first_stage_model_pbr.quantize(x_recon) # Sy: [b, 12, 32, 32]
+            else:
+                x_recon, _, [_, _, indices] = self.first_stage_model_env(x_recon)
+            # x_recon, _, [_, _, indices] = self.first_stage_model.quantize(x_recon)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t
         )
@@ -1712,7 +1900,7 @@ class LatentDiffusion(DDPM):
             if "shape" in kwargs:
                 shape = kwargs.pop("shape")
             else:
-                shape = (self.channels, image_size, image_size)
+                shape = (self.channels, image_size, image_size) # Sy: (15, 32, 32)
             samples, intermediates = ddim_sampler.sample(
                 ddim_steps, batch_size, shape, cond, verbose=False, **kwargs
             )
@@ -1754,7 +1942,7 @@ class LatentDiffusion(DDPM):
         batch,
         N=8,
         n_row=4,
-        sample=True,
+        sample=True, # Sy: 임시로 일단 끄고 ckeckpoint부터 얻어야할듯.
         ddim_steps=200,
         ddim_eta=1.0,
         return_keys=None,
@@ -1779,7 +1967,7 @@ class LatentDiffusion(DDPM):
             for i in range(len(batch[k])):
                 batch[k][i] = val
 
-        z, c, x, xrec, xc = self.get_input(
+        z_pbr, z_env, c, x, xrec_pbr, xrec_env, xc = self.get_input( # Sy: c = {'c_crossattn' : [b, 2, 512]}, xc = {'packed': , 'image_embed': , 'envs': , 'text': }
             batch,
             self.first_stage_key,
             return_first_stage_outputs=True,
@@ -1787,12 +1975,15 @@ class LatentDiffusion(DDPM):
             return_original_cond=True,
             bs=N,
         )
+        z = torch.cat([z_pbr, z_env], dim=1) # Sy:
 
         N = min(x.shape[0], N)
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
-        log["reconstruction"] = xrec
-        log["conditions"] = log_txt_as_img((256, 144), cond) # Sy: cond = ['image_embed']
+        # Sy: 
+        log["pbr reconstruction"] = xrec_pbr 
+        log["env reconstruction"] = xrec_env
+        # log["conditions"] = log_txt_as_img((256, 144), cond) # Sy: cond = ['image_embed'], It's shape is [1, 3, 144, 256] # Sy: Commented out a font-breaking error in the log_txt_as_img function in a hurry.
         if self.model.conditioning_key is not None:
             if hasattr(self.cond_stage_model, "decode"):
                 xc = self.cond_stage_model.decode(c)
@@ -1821,7 +2012,8 @@ class LatentDiffusion(DDPM):
                 # log["palette"] = torch.stack(
                 #     [visualize_palette(palette.cpu().numpy()) for palette in palettes]
                 # )
-                log["text"] = log_txt_as_img((256, 144), xc["text"])
+                
+                # log["text"] = log_txt_as_img((256, 144), xc["text"]) # Sy: Commented out a font-breaking error in the log_txt_as_img function in a hurry.
 
             if ismap(xc):
                 log["original_conditioning"] = self.to_rgb(xc)
@@ -1856,31 +2048,50 @@ class LatentDiffusion(DDPM):
                     eta=ddim_eta,
                 )
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
-            x_samples = self.decode_first_stage(samples)
-            log["samples"] = x_samples
+            # Sy:
+            samples_pbr = samples[:, :12, :, :]
+            smaples_env = samples[:, 12:, :, :]
+            x_pbr_samples = self.decode_first_stage(samples_pbr)
+            x_env_samples = self.decode_first_stage(smaples_env)
+            log["samples pbr"] = x_pbr_samples
+            log["smaples env"] = x_env_samples
             if plot_denoise_rows:
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
                 log["denoise_row"] = denoise_grid
+            # Sy: 
+            try:
+                if (
+                    quantize_denoised
+                    and not isinstance(self.first_stage_model_pbr, AutoencoderKL)
+                    and not isinstance(self.first_stage_model_pbr, IdentityFirstStage)
+                ):
+                    # also display when quantizing x0 while sampling
+                    with ema_scope("Plotting Quantized Denoised"):
+                        samples, z_denoise_row = self.sample_log(
+                            cond=c,
+                            batch_size=N,
+                            ddim=use_ddim,
+                            ddim_steps=ddim_steps,
+                            eta=ddim_eta,
+                            quantize_denoised=True,
+                        )
 
-            if (
-                quantize_denoised
-                and not isinstance(self.first_stage_model, AutoencoderKL)
-                and not isinstance(self.first_stage_model, IdentityFirstStage)
-            ):
-                # also display when quantizing x0 while sampling
-                with ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(
-                        cond=c,
-                        batch_size=N,
-                        ddim=use_ddim,
-                        ddim_steps=ddim_steps,
-                        eta=ddim_eta,
-                        quantize_denoised=True,
-                    )
-                    # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
-                    #                                      quantize_denoised=True)
-                x_samples = self.decode_first_stage(samples.to(self.device))
-                log["samples_x0_quantized"] = x_samples
+                        # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
+                        #                                      quantize_denoised=True)
+                    # Sy:
+                    x_samples_pbr = samples[:, :12, :, :]
+                    x_smaples_env = samples[:, 12:, :, :]
+                    x_pbr_samples = self.decode_first_stage(x_samples_pbr.to(self.device))
+  
+                    x_env_samples = self.decode_first_stage(x_smaples_env.to(self.device))
+   
+                    log["samples_x0_quantized pbr"] = x_pbr_samples
+                    log["samples_x0_quantized env"] = x_env_samples
+                    # x_samples = self.decode_first_stage(samples.to(self.device))
+                    # log["samples_x0_quantized"] = x_samples
+            except Exception as e:
+                print(f"Error occurred: {e}")
+                pass
 
         if unconditional_guidance_scale > 1.0:
             uc = self.get_unconditional_conditioning(N, unconditional_guidance_label)

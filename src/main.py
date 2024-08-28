@@ -23,7 +23,7 @@ from pytorch_lightning.utilities.distributed import rank_zero_only
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torchvision.utils import save_image
 
-import wandb
+# import wandb
 from ldm.data.material_utils import *  
 from ldm.util import instantiate_from_config
 

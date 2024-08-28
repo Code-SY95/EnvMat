@@ -164,6 +164,7 @@ wandb/
 *.pt
 *.ckpt
 *.tar
+*.tar.gz
 *.zip
 logs/
 log/
