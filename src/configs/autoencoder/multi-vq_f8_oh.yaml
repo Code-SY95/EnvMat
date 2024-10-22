@@ -50,7 +50,7 @@ data:
     validation:
       target: ldm.data.matfuse.MatFuseDataset
       params:
-        data_root: data/validation # Sy
+        data_root: data/test # Sy
         size: 256
         output_names:
           - basecolor

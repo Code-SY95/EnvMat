@@ -178,3 +178,5 @@ output_envmat_many/
 output_matfuse/
 gt_render/
 taming/
+old_ckpt/
+old_data/

@@ -1218,7 +1218,7 @@ class LatentDiffusion(DDPM):
         ).long()
         
         ### Sy: input_pbr, input_env is the G.T input maps. It will be used for compute renderig loss.
-        input_pbr = c["packed"][:, :12, :, :]
+        input_pbr = c["packed"][:, :12, :, :] # Sy: c is dataset dict. It has packed, text, renderimg...
         input_env = c["packed"][:, 12:, :, :]
         z = torch.cat([z_pbr, z_env], dim=1)
         
